@@ -278,18 +278,50 @@ async function exportExcel(filename: string, onStatus?: (msg: string) => void, o
 async function loadDocx(): Promise<any> {
   let docx: any = (globalThis as any).docx
   if (docx) return docx
-  await new Promise<void>((resolve, reject) => {
-    const s = document.createElement('script')
-    s.src = 'https://cdn.jsdelivr.net/npm/docx@8.6.0/build/index.min.js'
-    s.async = true
-    s.onload = () => resolve()
-    s.onerror = () => reject(new Error('docx 加载失败'))
-    document.head.appendChild(s)
-  })
+  try {
+    const mod: any = await import(/* @vite-ignore */ 'docx')
+    if (mod) return mod
+  } catch {}
+  const urls = [
+    'https://cdn.jsdelivr.net/npm/docx@9.5.1/build/index.min.js',
+    'https://cdn.jsdelivr.net/npm/docx@8.6.0/build/index.min.js',
+    'https://unpkg.com/docx@9.5.1/build/index.min.js',
+    'https://unpkg.com/docx@8.6.0/build/index.min.js',
+  ]
+  for (const u of urls) {
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const s = document.createElement('script')
+        let done = false
+        const timer = setTimeout(() => {
+          if (done) return
+          done = true
+          reject(new Error('docx 加载超时'))
+        }, 8000)
+        s.src = u
+        s.async = true
+        s.onload = () => {
+          if (done) return
+          done = true
+          clearTimeout(timer)
+          resolve()
+        }
+        s.onerror = () => {
+          if (done) return
+          done = true
+          clearTimeout(timer)
+          reject(new Error('docx 加载失败'))
+        }
+        document.head.appendChild(s)
+      })
+      docx = (globalThis as any).docx
+      if (docx) return docx
+    } catch {}
+  }
   return (globalThis as any).docx
 }
 
-async function exportWord(filename: string, onStatus?: (msg: string) => void, onProgress?: (done: number, total: number) => void, tableId?: string, viewId?: string) {
+async function exportWord(filename: string, onStatus?: (msg: string) => void, onProgress?: (done: number, total: number) => void, tableId?: string, viewId?: string, insertImages?: boolean, pageOrientation?: 'portrait' | 'landscape', showIndex?: boolean) {
   let table: any
   if (tableId) {
     table = await bitable.base.getTableById(tableId)
@@ -326,44 +358,190 @@ async function exportWord(filename: string, onStatus?: (msg: string) => void, on
     const field = await table.getField(fid)
     fieldObjMap.set(fid, field)
   }
+  const attachMeta = await table.getFieldMetaListByType(FieldType.Attachment)
+  const attachmentFieldIds = new Set<string>((attachMeta || []).map((m: any) => m.id))
   onStatus?.('加载 Word 库')
   const docx = await loadDocx()
-  if (!docx) throw new Error('docx 未找到')
-  const rows: any[] = []
+  if (docx) {
+    const displayFids: string[] = (showIndex === false) ? fieldIds : ['__INDEX__', ...fieldIds]
+    const headers = displayFids.map(fid => fid === '__INDEX__' ? '序号' : String(fieldNameMap.get(fid) || fid))
+    const canvas = document.createElement('canvas')
+    const ctx = canvas.getContext('2d')
+    if (ctx) {
+      ctx.font = '16px "Noto Sans SC","Microsoft YaHei",Arial,sans-serif'
+    }
+    const minColPx = 60
+    function measureTextPx(t: string): number {
+      if (!ctx) return Math.max(minColPx, (t || '').length * 8 + 12)
+      const w = ctx.measureText(t || '').width
+      return Math.max(minColPx, Math.ceil(w + 12))
+    }
+    const desired: number[] = headers.map(h => measureTextPx(h))
+    const sample = Math.min(recordIds.length, 50)
+    for (let r = 0; r < sample; r++) {
+      const rid = recordIds[r]
+      for (let i = 0; i < displayFids.length; i++) {
+        const dfid = displayFids[i]
+        if (dfid === '__INDEX__') {
+          desired[i] = Math.max(desired[i], measureTextPx(String(recordIds.length)))
+        } else {
+          try {
+            const s = await fieldObjMap.get(dfid).getCellString(rid)
+            desired[i] = Math.max(desired[i], measureTextPx(String(s ?? '')))
+          } catch {}
+        }
+      }
+    }
+    let sumDesired = desired.reduce((a, b) => a + b, 0)
+    if (!sumDesired || !isFinite(sumDesired)) sumDesired = minColPx * displayFids.length
+    let colPercents = desired.map(d => (d / sumDesired) * 100)
+    const sumPerc = colPercents.reduce((a, b) => a + b, 0)
+    if (Math.abs(sumPerc - 100) > 0.001) {
+      const adjust = 100 - sumPerc
+      colPercents[colPercents.length - 1] += adjust
+    }
+    const rows: any[] = []
   rows.push(new docx.TableRow({
-    children: fieldIds.map(fid => new docx.TableCell({
-      width: { size: 100 / fieldIds.length, type: docx.WidthType.PERCENTAGE },
-      children: [new docx.Paragraph(String(fieldNameMap.get(fid) || fid))]
+    children: displayFids.map((fid, i) => new docx.TableCell({
+      width: { size: colPercents[i], type: docx.WidthType.PERCENTAGE },
+      children: [new docx.Paragraph({
+        alignment: docx.AlignmentType.CENTER,
+        children: [new docx.TextRun({ text: fid === '__INDEX__' ? '序号' : String(fieldNameMap.get(fid) || fid), bold: true, size: 24, font: 'Microsoft YaHei' })]
+      })]
     }))
   }))
+    for (let r = 0; r < recordIds.length; r++) {
+      const rid = recordIds[r]
+    const cells = await Promise.all(displayFids.map(async (fid, i) => {
+      const children: any[] = []
+      if (fid === '__INDEX__') {
+        const textVal = String(r + 1)
+        children.push(new docx.Paragraph({ alignment: docx.AlignmentType.CENTER, children: [new docx.TextRun({ text: textVal, size: 24, font: 'Microsoft YaHei' })] }))
+      } else {
+        let textVal = ''
+        try {
+          const s = await fieldObjMap.get(fid).getCellString(rid)
+          textVal = String(s ?? '')
+        } catch {
+          textVal = ''
+        }
+        if (insertImages && attachmentFieldIds.has(fid)) {
+          textVal = ''
+        }
+        if (textVal) children.push(new docx.Paragraph({ children: [new docx.TextRun({ text: textVal, size: 24, font: 'Microsoft YaHei' })] }))
+        if (insertImages && attachmentFieldIds.has(fid)) {
+          try {
+            const val = await fieldObjMap.get(fid).getValue(rid)
+            const arr = Array.isArray(val) ? val : (val ? [val] : [])
+            const tokens = arr.map(a => a?.token).filter(Boolean) as string[]
+            if (tokens.length) {
+              const urls = await table.getCellAttachmentUrls(tokens, fid, rid)
+              const tasks = (urls || []).map(async (url: string | undefined) => {
+                if (!url) return null
+                const res = await fetch(url)
+                const blob = await res.blob()
+                if (!blob.type.startsWith('image/')) return null
+                const buf = await blob.arrayBuffer()
+                const data = new Uint8Array(buf)
+                const dataUrl = await new Promise<string>((resolve, reject) => {
+                  const fr = new FileReader()
+                  fr.onload = () => resolve(String(fr.result))
+                  fr.onerror = reject
+                  fr.readAsDataURL(blob)
+                })
+                const dims = await new Promise<{ w: number; h: number }>((resolve) => {
+                  const img = new Image()
+                  img.onload = () => {
+                    const iw = img.naturalWidth || 1
+                    const ih = img.naturalHeight || 1
+                    const pagePx = pageOrientation === 'landscape' ? 1120 : 794
+                    const innerPx = pagePx - 192
+                    const colMaxW = Math.max(180, Math.floor(innerPx * colPercents[i] / 100) - 12)
+                    const maxW = Math.max(240, colMaxW)
+                    const maxH = 400
+                    const minW = 300
+                    const minH = 225
+                    const ratioMax = Math.min(maxW / iw, maxH / ih)
+                    const ratioMin = Math.max(minW / iw, minH / ih)
+                    const ratio = Math.min(Math.max(ratioMin, 0), ratioMax)
+                    resolve({ w: Math.max(1, Math.floor(iw * ratio)), h: Math.max(1, Math.floor(ih * ratio)) })
+                  }
+                  img.src = dataUrl
+                })
+                return { data, w: dims.w, h: dims.h }
+              })
+              const imgs = (await Promise.all(tasks)).filter(Boolean) as Array<{ data: Uint8Array; w: number; h: number }>
+              for (const im of imgs) {
+                children.push(new docx.Paragraph({ children: [new docx.ImageRun({ data: im.data, transformation: { width: im.w, height: im.h } })] }))
+              }
+            }
+          } catch {}
+        }
+      }
+      return new docx.TableCell({
+        width: { size: colPercents[i], type: docx.WidthType.PERCENTAGE },
+        children
+      })
+    }))
+      rows.push(new docx.TableRow({ children: cells }))
+      if ((r + 1) % 10 === 0 || r === recordIds.length - 1) {
+        onProgress?.(r + 1, recordIds.length)
+        onStatus?.(`写入 ${r + 1}/${recordIds.length}`)
+      }
+    }
+    const doc = new docx.Document({
+      sections: [{
+        properties: {
+          page: {
+            size: { orientation: pageOrientation === 'landscape' ? docx.PageOrientation.LANDSCAPE : docx.PageOrientation.PORTRAIT }
+          }
+        },
+        children: [new docx.Table({ rows })]
+      }]
+    })
+    const safe = filename && filename.trim().length ? filename.trim() : '导出.docx'
+    const finalName = safe.endsWith('.docx') ? safe : `${safe}.docx`
+    const blob = await docx.Packer.toBlob(doc)
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = finalName
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    URL.revokeObjectURL(url)
+    return
+  }
+  onStatus?.('docx 加载失败，尝试 HTML DOCX')
+  const htmlDocx = await loadHtmlDocx()
+  if (!htmlDocx || !htmlDocx.asBlob) throw new Error('html-docx-js 未找到')
+  function esc(s: string) {
+    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  }
+  let html = '<!doctype html><html><head><meta charset="utf-8"><style>table{border-collapse:collapse;width:100%}th,td{border:1px solid #000;padding:4px;font-size:12pt;font-family:\"Noto Sans SC\",\"Microsoft YaHei\",sans-serif;}th{text-align:center;font-weight:bold}</style></head><body><table>'
+  const displayFidsHtml: string[] = (showIndex === false) ? fieldIds : ['__INDEX__', ...fieldIds]
+  html += '<tr>' + displayFidsHtml.map(fid => `<th>${esc(fid === '__INDEX__' ? '序号' : String(fieldNameMap.get(fid) || fid))}</th>`).join('') + '</tr>'
   for (let r = 0; r < recordIds.length; r++) {
     const rid = recordIds[r]
-    const cells = await Promise.all(fieldIds.map(async fid => {
+    const cells = await Promise.all(displayFidsHtml.map(async fid => {
+      if (fid === '__INDEX__') return `<td style="text-align:center">${esc(String(r + 1))}</td>`
       try {
         const s = await fieldObjMap.get(fid).getCellString(rid)
-        return new docx.TableCell({
-          width: { size: 100 / fieldIds.length, type: docx.WidthType.PERCENTAGE },
-          children: [new docx.Paragraph(String(s ?? ''))]
-        })
+        return `<td>${esc(String(s ?? ''))}</td>`
       } catch {
-        return new docx.TableCell({
-          width: { size: 100 / fieldIds.length, type: docx.WidthType.PERCENTAGE },
-          children: [new docx.Paragraph('')]
-        })
+        return '<td></td>'
       }
     }))
-    rows.push(new docx.TableRow({ children: cells }))
+    html += `<tr>${cells.join('')}</tr>`
     if ((r + 1) % 10 === 0 || r === recordIds.length - 1) {
       onProgress?.(r + 1, recordIds.length)
       onStatus?.(`写入 ${r + 1}/${recordIds.length}`)
     }
   }
-  const doc = new docx.Document({
-    sections: [{ properties: {}, children: [new docx.Table({ rows })] }]
-  })
+  html += '</table></body></html>'
   const safe = filename && filename.trim().length ? filename.trim() : '导出.docx'
   const finalName = safe.endsWith('.docx') ? safe : `${safe}.docx`
-  const blob = await docx.Packer.toBlob(doc)
+  const blob = htmlDocx.asBlob(html, { orientation: pageOrientation === 'landscape' ? 'landscape' : 'portrait' })
   const url = URL.createObjectURL(blob)
   const a = document.createElement('a')
   a.href = url
@@ -372,6 +550,46 @@ async function exportWord(filename: string, onStatus?: (msg: string) => void, on
   a.click()
   a.remove()
   URL.revokeObjectURL(url)
+}
+
+async function loadHtmlDocx(): Promise<any> {
+  let htmlDocx: any = (globalThis as any).htmlDocx
+  if (htmlDocx) return htmlDocx
+  const urls = [
+    'https://cdn.jsdelivr.net/npm/html-docx-js@0.3.1/dist/html-docx.min.js',
+    'https://unpkg.com/html-docx-js@0.3.1/dist/html-docx.min.js',
+  ]
+  for (const u of urls) {
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const s = document.createElement('script')
+        let done = false
+        const timer = setTimeout(() => {
+          if (done) return
+          done = true
+          reject(new Error('html-docx-js 加载超时'))
+        }, 8000)
+        s.src = u
+        s.async = true
+        s.onload = () => {
+          if (done) return
+          done = true
+          clearTimeout(timer)
+          resolve()
+        }
+        s.onerror = () => {
+          if (done) return
+          done = true
+          clearTimeout(timer)
+          reject(new Error('html-docx-js 加载失败'))
+        }
+        document.head.appendChild(s)
+      })
+      htmlDocx = (globalThis as any).htmlDocx
+      if (htmlDocx) return htmlDocx
+    } catch {}
+  }
+  return (globalThis as any).htmlDocx
 }
 
 async function loadJsPDF(): Promise<any> {
@@ -390,7 +608,7 @@ async function loadJsPDF(): Promise<any> {
   return jspdf
 }
 
-async function exportPDF(filename: string, onStatus?: (msg: string) => void, onProgress?: (done: number, total: number) => void, tableId?: string, viewId?: string) {
+async function exportPDF(filename: string, onStatus?: (msg: string) => void, onProgress?: (done: number, total: number) => void, tableId?: string, viewId?: string, insertImages?: boolean, pageOrientation?: 'portrait' | 'landscape', showIndex?: boolean) {
   let table: any
   if (tableId) {
     table = await bitable.base.getTableById(tableId)
@@ -427,46 +645,230 @@ async function exportPDF(filename: string, onStatus?: (msg: string) => void, onP
     const field = await table.getField(fid)
     fieldObjMap.set(fid, field)
   }
+  const attachMeta = await table.getFieldMetaListByType(FieldType.Attachment)
+  const attachmentFieldIds = new Set<string>((attachMeta || []).map((m: any) => m.id))
   onStatus?.('加载 PDF 库')
   const jspdf = await loadJsPDF()
   if (!jspdf || !jspdf.jsPDF) throw new Error('jsPDF 未找到')
-  const doc = new jspdf.jsPDF({ orientation: 'portrait', unit: 'pt', format: 'a4' })
+  const doc = new jspdf.jsPDF({ orientation: pageOrientation || 'portrait', unit: 'pt', format: 'a4' })
+  async function toB64(ab: ArrayBuffer) {
+    let s = ''
+    const bytes = new Uint8Array(ab)
+    const chunk = 0x8000
+    for (let i = 0; i < bytes.length; i += chunk) {
+      s += String.fromCharCode(...bytes.subarray(i, i + chunk))
+    }
+    return btoa(s)
+  }
+  async function ensureCJKFont() {
+    const urls = [
+      'https://cdn.jsdelivr.net/gh/jsntn/webfonts/NotoSansSC-Regular.ttf',
+      'https://raw.githubusercontent.com/jsntn/webfonts/master/NotoSansSC-Regular.ttf',
+    ]
+    for (const u of urls) {
+      try {
+        const res = await fetch(u, { cache: 'force-cache' })
+        if (!res.ok) continue
+        const buf = await res.arrayBuffer()
+        const b64 = await toB64(buf)
+        const fname = 'NotoSansSC-Regular.ttf'
+        doc.addFileToVFS(fname, b64)
+        doc.addFont(fname, 'NotoSansSC', 'normal')
+        doc.setFont('NotoSansSC', 'normal')
+        return
+      } catch {}
+    }
+  }
+  await ensureCJKFont()
   const pageW = doc.internal.pageSize.getWidth()
   const pageH = doc.internal.pageSize.getHeight()
   const margin = 40
   const startX = margin
   let y = margin
-  const colW = (pageW - margin * 2) / fieldIds.length
+  const innerW = pageW - margin * 2
   const lh = 14
-  const headers = fieldIds.map(fid => String(fieldNameMap.get(fid) || fid))
-  headers.forEach((h, i) => {
-    const x = startX + i * colW
-    doc.text(h, x + 4, y + lh)
-  })
-  y += lh + 8
+  doc.setFontSize(12)
+  doc.setLineWidth(0.5)
+  doc.setDrawColor(160, 160, 160)
+  doc.setTextColor(0, 0, 0)
+  const displayFids: string[] = (showIndex === false) ? fieldIds : ['__INDEX__', ...fieldIds]
+  const headers = displayFids.map(fid => fid === '__INDEX__' ? '序号' : String(fieldNameMap.get(fid) || fid))
+  const headerH = lh + 8
+  function textBold(t: string, x: number, yy: number) {
+    doc.text(t, x, yy)
+    doc.text(t, x + 0.25, yy)
+    doc.text(t, x, yy + 0.25)
+  }
+  const minColW = 60
+  const desired: number[] = headers.map(h => Math.max(doc.getTextWidth(h) + 12, minColW))
+  const sample = Math.min(recordIds.length, 50)
+  for (let r = 0; r < sample; r++) {
+    const rid = recordIds[r]
+    for (let i = 0; i < displayFids.length; i++) {
+      const dfid = displayFids[i]
+      if (dfid === '__INDEX__') {
+        const w = doc.getTextWidth(String(recordIds.length))
+        desired[i] = Math.max(desired[i], w + 12)
+      } else {
+        try {
+          const s = await fieldObjMap.get(dfid).getCellString(rid)
+          const w = doc.getTextWidth(String(s ?? ''))
+          desired[i] = Math.max(desired[i], w + 12)
+        } catch {}
+      }
+    }
+  }
+  let colWs: number[] = []
+  if (minColW * displayFids.length > innerW) {
+    const eq = innerW / displayFids.length
+    colWs = new Array(displayFids.length).fill(eq)
+  } else {
+    const sumDesired = desired.reduce((a, b) => a + b, 0) || innerW
+    colWs = desired.map(d => innerW * (d / sumDesired))
+    for (let i = 0; i < colWs.length; i++) {
+      if (colWs[i] < minColW) colWs[i] = minColW
+    }
+    let sumWs = colWs.reduce((a, b) => a + b, 0)
+    let delta = innerW - sumWs
+    if (Math.abs(delta) > 0.5) {
+      if (delta > 0) {
+        const weightSum = colWs.reduce((a, b) => a + b, 0)
+        for (let i = 0; i < colWs.length; i++) {
+          colWs[i] += delta * (colWs[i] / weightSum)
+        }
+      } else {
+        const flex = colWs.map(w => Math.max(0, w - minColW))
+        const flexSum = flex.reduce((a, b) => a + b, 0)
+        if (flexSum > 0) {
+          for (let i = 0; i < colWs.length; i++) {
+            const reduce = (-delta) * (flex[i] / flexSum)
+            colWs[i] = Math.max(minColW, colWs[i] - reduce)
+          }
+        } else {
+          const eq = innerW / displayFids.length
+          colWs = new Array(displayFids.length).fill(eq)
+        }
+      }
+      const adjust = innerW - colWs.reduce((a, b) => a + b, 0)
+      colWs[colWs.length - 1] += adjust
+    }
+  }
+  function colX(i: number) {
+    let x = startX
+    for (let k = 0; k < i; k++) x += colWs[k]
+    return x
+  }
+  function drawHeader() {
+    for (let i = 0; i < headers.length; i++) {
+      const x = colX(i)
+      const w = colWs[i]
+      doc.rect(x, y, w, headerH, 'S')
+      const tw = doc.getTextWidth(headers[i])
+      const cx = x + w / 2 - tw / 2
+      textBold(headers[i], cx, y + lh)
+    }
+    y += headerH
+  }
+  drawHeader()
   for (let r = 0; r < recordIds.length; r++) {
     const rid = recordIds[r]
-    const texts: string[] = await Promise.all(fieldIds.map(async fid => {
+    const texts: string[] = await Promise.all(displayFids.map(async fid => {
+      if (fid === '__INDEX__') return String(r + 1)
       try {
+        if (insertImages && attachmentFieldIds.has(fid)) return ''
         const s = await fieldObjMap.get(fid).getCellString(rid)
         return String(s ?? '')
       } catch {
         return ''
       }
     }))
+    const linesArr: string[][] = []
+    const textHeights: number[] = []
     let rowH = lh
-    for (let i = 0; i < fieldIds.length; i++) {
-      const x = startX + i * colW
-      const lines = doc.splitTextToSize(texts[i], colW - 8)
-      doc.text(lines, x + 4, y + lh)
-      rowH = Math.max(rowH, lines.length * lh + 6)
+    for (let i = 0; i < displayFids.length; i++) {
+      const lines = doc.splitTextToSize(texts[i], colWs[i] - 8)
+      linesArr[i] = lines
+      const th = lines.length * lh
+      textHeights[i] = th
+      rowH = Math.max(rowH, th + 6)
+    }
+    const imageInfos: Array<Array<{ dataUrl: string; ext: string; w: number; h: number }>> = Array.from({ length: displayFids.length }, () => [])
+    if (insertImages) {
+      const tasks: Promise<void>[] = []
+      for (let i = 0; i < displayFids.length; i++) {
+        const fid = displayFids[i]
+        if (fid === '__INDEX__') continue
+        if (!attachmentFieldIds.has(fid)) continue
+        tasks.push((async () => {
+          try {
+            const val = await fieldObjMap.get(fid).getValue(rid)
+            const arr = Array.isArray(val) ? val : (val ? [val] : [])
+            const tokens = arr.map(a => a?.token).filter(Boolean) as string[]
+            if (!tokens.length) return
+            const urls = await table.getCellAttachmentUrls(tokens, fid, rid)
+            const subtasks = (urls || []).map(async (url: string | undefined) => {
+              if (!url) return null
+              const res = await fetch(url)
+              const blob = await res.blob()
+              if (!blob.type.startsWith('image/')) return null
+              const dataUrl = await new Promise<string>((resolve, reject) => {
+                const fr = new FileReader()
+                fr.onload = () => resolve(String(fr.result))
+                fr.onerror = reject
+                fr.readAsDataURL(blob)
+              })
+              const ext = blob.type.includes('jpeg') || blob.type.includes('jpg') ? 'JPEG' : blob.type.includes('png') ? 'PNG' : blob.type.includes('gif') ? 'GIF' : 'PNG'
+              const maxW = colWs[i] - 8
+              const maxH = 300
+              const minW = Math.min(maxW, 240)
+              const minH = 180
+              const dims = await new Promise<{ w: number; h: number }>((resolve) => {
+                const img = new Image()
+                img.onload = () => {
+                  const iw = img.naturalWidth || 1
+                  const ih = img.naturalHeight || 1
+                  const ratioMax = Math.min(maxW / iw, maxH / ih)
+                  const ratioMin = Math.max(minW / iw, minH / ih)
+                  const ratio = Math.min(Math.max(ratioMin, 0), ratioMax)
+                  resolve({ w: Math.max(1, Math.floor(iw * ratio)), h: Math.max(1, Math.floor(ih * ratio)) })
+                }
+                img.src = dataUrl
+              })
+              return { dataUrl, ext, w: dims.w, h: dims.h }
+            })
+            const infos = (await Promise.all(subtasks)).filter(Boolean) as Array<{ dataUrl: string; ext: string; w: number; h: number }>
+            imageInfos[i] = infos
+          } catch {}
+        })())
+      }
+      await Promise.all(tasks)
+      for (let i = 0; i < displayFids.length; i++) {
+        const sumH = imageInfos[i].reduce((a, b) => a + b.h + 2, 0)
+        rowH = Math.max(rowH, (textHeights[i] || 0) + 6 + sumH)
+      }
     }
     if (y + rowH + margin > pageH) {
       doc.addPage()
       y = margin
-    } else {
-      y += rowH
+      drawHeader()
     }
+    for (let i = 0; i < displayFids.length; i++) {
+      const x = colX(i)
+      doc.rect(x, y, colWs[i], rowH, 'S')
+      if (displayFids[i] === '__INDEX__') {
+        doc.text(String(texts[i] || ''), x + colWs[i] / 2, y + lh, { align: 'center' })
+      } else {
+        doc.text(linesArr[i], x + 4, y + lh)
+      }
+      if (imageInfos[i].length) {
+        let iy = y + (textHeights[i] || 0) + 6
+        for (const info of imageInfos[i]) {
+          doc.addImage(info.dataUrl, info.ext, x + 4, iy, info.w, info.h)
+          iy += info.h + 2
+        }
+      }
+    }
+    y += rowH
     if ((r + 1) % 10 === 0 || r === recordIds.length - 1) {
       onProgress?.(r + 1, recordIds.length)
       onStatus?.(`写入 ${r + 1}/${recordIds.length}`)
@@ -488,6 +890,9 @@ export default function App() {
   const [tableId, setTableId] = useState<string>()
   const [viewId, setViewId] = useState<string>()
   const [format, setFormat] = useState<'xlsx' | 'docx' | 'pdf'>('xlsx')
+  const [insertImages, setInsertImages] = useState<boolean>(false)
+  const [pageOrientation, setPageOrientation] = useState<'portrait' | 'landscape'>('portrait')
+  const [showIndex, setShowIndex] = useState<boolean>(true)
   const [startTs, setStartTs] = useState<number | null>(null)
   const disabled = useMemo(() => !name.trim().length, [name])
   const percent = useMemo(() => (progress.total ? Math.round((progress.done * 100) / progress.total) : 0), [progress])
@@ -518,9 +923,9 @@ export default function App() {
       if (format === 'xlsx') {
         await exportExcel(name, (msg: string) => setStatus(msg), (d: number, t: number) => { setProgress({ done: d, total: t }); setStartTs(s => s ?? Date.now()) }, tableId, viewId)
       } else if (format === 'docx') {
-        await exportWord(name, (msg: string) => setStatus(msg), (d: number, t: number) => { setProgress({ done: d, total: t }); setStartTs(s => s ?? Date.now()) }, tableId, viewId)
+        await exportWord(name, (msg: string) => setStatus(msg), (d: number, t: number) => { setProgress({ done: d, total: t }); setStartTs(s => s ?? Date.now()) }, tableId, viewId, insertImages, pageOrientation, showIndex)
       } else {
-        await exportPDF(name, (msg: string) => setStatus(msg), (d: number, t: number) => { setProgress({ done: d, total: t }); setStartTs(s => s ?? Date.now()) }, tableId, viewId)
+        await exportPDF(name, (msg: string) => setStatus(msg), (d: number, t: number) => { setProgress({ done: d, total: t }); setStartTs(s => s ?? Date.now()) }, tableId, viewId, insertImages, pageOrientation, showIndex)
       }
       setStatus('导出完成')
     } catch (e: any) {
@@ -596,6 +1001,45 @@ export default function App() {
             <option value="pdf">PDF</option>
           </select>
         </div>
+        {(format === 'docx' || format === 'pdf') ? (
+          <div className="field">
+            <label className="label">插入附件图片</label>
+            <div className="radio-group">
+              <label style={{ marginRight: 16 }}>
+                <input type="radio" checked={insertImages === true} onChange={() => setInsertImages(true)} /> 是
+              </label>
+              <label>
+                <input type="radio" checked={insertImages === false} onChange={() => setInsertImages(false)} /> 否
+              </label>
+            </div>
+          </div>
+        ) : null}
+        {(format === 'docx' || format === 'pdf') ? (
+          <div className="field">
+            <label className="label">页面方向</label>
+            <div className="radio-group">
+              <label style={{ marginRight: 16 }}>
+                <input type="radio" checked={pageOrientation === 'portrait'} onChange={() => setPageOrientation('portrait')} /> 纵向
+              </label>
+              <label>
+                <input type="radio" checked={pageOrientation === 'landscape'} onChange={() => setPageOrientation('landscape')} /> 横向
+              </label>
+            </div>
+          </div>
+        ) : null}
+        {(format === 'docx' || format === 'pdf') ? (
+          <div className="field">
+            <label className="label">显示序号</label>
+            <div className="radio-group">
+              <label style={{ marginRight: 16 }}>
+                <input type="radio" checked={showIndex === true} onChange={() => setShowIndex(true)} /> 是
+              </label>
+              <label>
+                <input type="radio" checked={showIndex === false} onChange={() => setShowIndex(false)} /> 否
+              </label>
+            </div>
+          </div>
+        ) : null}
         <button className="btn btn-primary" onClick={onExport} disabled={disabled || exporting}>开始导出</button>
         <div className="status">状态：{status}</div>
         {exporting || progress.total > 0 ? (
