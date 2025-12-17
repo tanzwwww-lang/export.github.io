@@ -275,6 +275,208 @@ async function exportExcel(filename: string, onStatus?: (msg: string) => void, o
   URL.revokeObjectURL(url)
 }
 
+async function loadDocx(): Promise<any> {
+  let docx: any = (globalThis as any).docx
+  if (docx) return docx
+  await new Promise<void>((resolve, reject) => {
+    const s = document.createElement('script')
+    s.src = 'https://cdn.jsdelivr.net/npm/docx@8.6.0/build/index.min.js'
+    s.async = true
+    s.onload = () => resolve()
+    s.onerror = () => reject(new Error('docx 加载失败'))
+    document.head.appendChild(s)
+  })
+  return (globalThis as any).docx
+}
+
+async function exportWord(filename: string, onStatus?: (msg: string) => void, onProgress?: (done: number, total: number) => void, tableId?: string, viewId?: string) {
+  let table: any
+  if (tableId) {
+    table = await bitable.base.getTableById(tableId)
+  } else {
+    try {
+      table = await getActiveTable()
+    } catch {
+      const list = await bitable.base.getTableList()
+      table = list && list[0]
+      if (!table) throw new Error('无法获取数据表')
+    }
+  }
+  let view: any = null
+  if (viewId) {
+    try {
+      const vlist = await table.getViewList()
+      view = (vlist || []).find((v: any) => v.id === viewId) || null
+    } catch {}
+  }
+  if (!view) {
+    try {
+      view = await getActiveView(table)
+    } catch {}
+  }
+  const fieldIds: string[] = await getFieldIds(table, view)
+  const recordIds: string[] = await getRecordIds(table, view)
+  onProgress?.(0, recordIds.length)
+  onStatus?.('收集字段与记录')
+  const fieldNameMap = new Map<string, string>()
+  const fieldObjMap = new Map<string, any>()
+  for (const fid of fieldIds) {
+    const name = await getFieldName(table, fid)
+    fieldNameMap.set(fid, name)
+    const field = await table.getField(fid)
+    fieldObjMap.set(fid, field)
+  }
+  onStatus?.('加载 Word 库')
+  const docx = await loadDocx()
+  if (!docx) throw new Error('docx 未找到')
+  const rows: any[] = []
+  rows.push(new docx.TableRow({
+    children: fieldIds.map(fid => new docx.TableCell({
+      width: { size: 100 / fieldIds.length, type: docx.WidthType.PERCENTAGE },
+      children: [new docx.Paragraph(String(fieldNameMap.get(fid) || fid))]
+    }))
+  }))
+  for (let r = 0; r < recordIds.length; r++) {
+    const rid = recordIds[r]
+    const cells = await Promise.all(fieldIds.map(async fid => {
+      try {
+        const s = await fieldObjMap.get(fid).getCellString(rid)
+        return new docx.TableCell({
+          width: { size: 100 / fieldIds.length, type: docx.WidthType.PERCENTAGE },
+          children: [new docx.Paragraph(String(s ?? ''))]
+        })
+      } catch {
+        return new docx.TableCell({
+          width: { size: 100 / fieldIds.length, type: docx.WidthType.PERCENTAGE },
+          children: [new docx.Paragraph('')]
+        })
+      }
+    }))
+    rows.push(new docx.TableRow({ children: cells }))
+    if ((r + 1) % 10 === 0 || r === recordIds.length - 1) {
+      onProgress?.(r + 1, recordIds.length)
+      onStatus?.(`写入 ${r + 1}/${recordIds.length}`)
+    }
+  }
+  const doc = new docx.Document({
+    sections: [{ properties: {}, children: [new docx.Table({ rows })] }]
+  })
+  const safe = filename && filename.trim().length ? filename.trim() : '导出.docx'
+  const finalName = safe.endsWith('.docx') ? safe : `${safe}.docx`
+  const blob = await docx.Packer.toBlob(doc)
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = finalName
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  URL.revokeObjectURL(url)
+}
+
+async function loadJsPDF(): Promise<any> {
+  let jspdf: any = (globalThis as any).jspdf
+  if (!jspdf) {
+    await new Promise<void>((resolve, reject) => {
+      const s = document.createElement('script')
+      s.src = 'https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js'
+      s.async = true
+      s.onload = () => resolve()
+      s.onerror = () => reject(new Error('jsPDF 加载失败'))
+      document.head.appendChild(s)
+    })
+    jspdf = (globalThis as any).jspdf
+  }
+  return jspdf
+}
+
+async function exportPDF(filename: string, onStatus?: (msg: string) => void, onProgress?: (done: number, total: number) => void, tableId?: string, viewId?: string) {
+  let table: any
+  if (tableId) {
+    table = await bitable.base.getTableById(tableId)
+  } else {
+    try {
+      table = await getActiveTable()
+    } catch {
+      const list = await bitable.base.getTableList()
+      table = list && list[0]
+      if (!table) throw new Error('无法获取数据表')
+    }
+  }
+  let view: any = null
+  if (viewId) {
+    try {
+      const vlist = await table.getViewList()
+      view = (vlist || []).find((v: any) => v.id === viewId) || null
+    } catch {}
+  }
+  if (!view) {
+    try {
+      view = await getActiveView(table)
+    } catch {}
+  }
+  const fieldIds: string[] = await getFieldIds(table, view)
+  const recordIds: string[] = await getRecordIds(table, view)
+  onProgress?.(0, recordIds.length)
+  onStatus?.('收集字段与记录')
+  const fieldNameMap = new Map<string, string>()
+  const fieldObjMap = new Map<string, any>()
+  for (const fid of fieldIds) {
+    const name = await getFieldName(table, fid)
+    fieldNameMap.set(fid, name)
+    const field = await table.getField(fid)
+    fieldObjMap.set(fid, field)
+  }
+  onStatus?.('加载 PDF 库')
+  const jspdf = await loadJsPDF()
+  if (!jspdf || !jspdf.jsPDF) throw new Error('jsPDF 未找到')
+  const doc = new jspdf.jsPDF({ orientation: 'portrait', unit: 'pt', format: 'a4' })
+  const pageW = doc.internal.pageSize.getWidth()
+  const pageH = doc.internal.pageSize.getHeight()
+  const margin = 40
+  const startX = margin
+  let y = margin
+  const colW = (pageW - margin * 2) / fieldIds.length
+  const lh = 14
+  const headers = fieldIds.map(fid => String(fieldNameMap.get(fid) || fid))
+  headers.forEach((h, i) => {
+    const x = startX + i * colW
+    doc.text(h, x + 4, y + lh)
+  })
+  y += lh + 8
+  for (let r = 0; r < recordIds.length; r++) {
+    const rid = recordIds[r]
+    const texts: string[] = await Promise.all(fieldIds.map(async fid => {
+      try {
+        const s = await fieldObjMap.get(fid).getCellString(rid)
+        return String(s ?? '')
+      } catch {
+        return ''
+      }
+    }))
+    let rowH = lh
+    for (let i = 0; i < fieldIds.length; i++) {
+      const x = startX + i * colW
+      const lines = doc.splitTextToSize(texts[i], colW - 8)
+      doc.text(lines, x + 4, y + lh)
+      rowH = Math.max(rowH, lines.length * lh + 6)
+    }
+    if (y + rowH + margin > pageH) {
+      doc.addPage()
+      y = margin
+    } else {
+      y += rowH
+    }
+    if ((r + 1) % 10 === 0 || r === recordIds.length - 1) {
+      onProgress?.(r + 1, recordIds.length)
+      onStatus?.(`写入 ${r + 1}/${recordIds.length}`)
+    }
+  }
+  const safe = filename && filename.trim().length ? filename.trim() : '导出.pdf'
+  const finalName = safe.endsWith('.pdf') ? safe : `${safe}.pdf`
+  doc.save(finalName)
+}
+
 export default function App() {
   const [name, setName] = useState('')
   const [nameDirty, setNameDirty] = useState(false)
@@ -285,6 +487,7 @@ export default function App() {
   const [views, setViews] = useState<{ label: string; value: string }[]>([])
   const [tableId, setTableId] = useState<string>()
   const [viewId, setViewId] = useState<string>()
+  const [format, setFormat] = useState<'xlsx' | 'docx' | 'pdf'>('xlsx')
   const [startTs, setStartTs] = useState<number | null>(null)
   const disabled = useMemo(() => !name.trim().length, [name])
   const percent = useMemo(() => (progress.total ? Math.round((progress.done * 100) / progress.total) : 0), [progress])
@@ -312,7 +515,13 @@ export default function App() {
     setProgress({ done: 0, total: 0 })
     setStartTs(null)
     try {
-      await exportExcel(name, (msg: string) => setStatus(msg), (d: number, t: number) => { setProgress({ done: d, total: t }); setStartTs(s => s ?? Date.now()) }, tableId, viewId)
+      if (format === 'xlsx') {
+        await exportExcel(name, (msg: string) => setStatus(msg), (d: number, t: number) => { setProgress({ done: d, total: t }); setStartTs(s => s ?? Date.now()) }, tableId, viewId)
+      } else if (format === 'docx') {
+        await exportWord(name, (msg: string) => setStatus(msg), (d: number, t: number) => { setProgress({ done: d, total: t }); setStartTs(s => s ?? Date.now()) }, tableId, viewId)
+      } else {
+        await exportPDF(name, (msg: string) => setStatus(msg), (d: number, t: number) => { setProgress({ done: d, total: t }); setStartTs(s => s ?? Date.now()) }, tableId, viewId)
+      }
       setStatus('导出完成')
     } catch (e: any) {
       setStatus(`导出失败: ${e?.message || String(e)}`)
@@ -379,7 +588,15 @@ export default function App() {
           <label className="label">文件名</label>
           <input className="input" value={name} onChange={e => { setName(e.target.value); setNameDirty(true) }} placeholder="导出文件名" />
         </div>
-        <button className="btn btn-primary" onClick={onExport} disabled={disabled || exporting}>导出为 Excel</button>
+        <div className="field">
+          <label className="label">导出格式</label>
+          <select className="select" value={format} onChange={e => setFormat(e.target.value as any)}>
+            <option value="xlsx">Excel</option>
+            <option value="docx">Word</option>
+            <option value="pdf">PDF</option>
+          </select>
+        </div>
+        <button className="btn btn-primary" onClick={onExport} disabled={disabled || exporting}>开始导出</button>
         <div className="status">状态：{status}</div>
         {exporting || progress.total > 0 ? (
           <>
