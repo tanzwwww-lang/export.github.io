@@ -5,7 +5,7 @@ export default defineConfig({
   plugins: [react()],
   base: './',
   optimizeDeps: {
-    exclude: ['exceljs', 'exceljs/dist/exceljs.min.js', 'docx', 'jspdf'],
+    exclude: ['exceljs', 'exceljs/dist/exceljs.min.js', 'jspdf'],
   },
   server: {
     host: true,
