@@ -675,7 +675,7 @@ async function loadJsPDF(): Promise<any> {
   return jspdf
 }
 
-async function exportPDF(filename: string, onStatus?: (msg: string) => void, onProgress?: (done: number, total: number) => void, tableId?: string, viewId?: string, insertImages?: boolean, pageOrientation?: 'portrait' | 'landscape', showIndex?: boolean) {
+async function exportPDF(filename: string, onStatus?: (msg: string) => void, onProgress?: (done: number, total: number) => void, tableId?: string, viewId?: string, insertImages?: boolean, pageOrientation?: 'portrait' | 'landscape', showIndex?: boolean, showPageNumber?: boolean) {
   let table: any
   if (tableId) {
     table = await bitable.base.getTableById(tableId)
@@ -1024,6 +1024,18 @@ async function exportPDF(filename: string, onStatus?: (msg: string) => void, onP
       onStatus?.(`写入 ${r + 1}/${recordIds.length}`)
     }
   }
+  if (showPageNumber) {
+    const count = doc.internal.getNumberOfPages()
+    const size = 10
+    for (let i = 1; i <= count; i++) {
+      doc.setPage(i)
+      const pw = doc.internal.pageSize.getWidth()
+      const ph = doc.internal.pageSize.getHeight()
+      doc.setFontSize(size)
+      doc.text(`${i}/${count}`, pw / 2, ph - 20, { align: 'center' })
+    }
+    doc.setFontSize(12)
+  }
   const safe = filename && filename.trim().length ? filename.trim() : '导出.pdf'
   const finalName = safe.endsWith('.pdf') ? safe : `${safe}.pdf`
   doc.save(finalName)
@@ -1043,6 +1055,7 @@ export default function App() {
   const [insertImages, setInsertImages] = useState<boolean>(false)
   const [pageOrientation, setPageOrientation] = useState<'portrait' | 'landscape'>('portrait')
   const [showIndex, setShowIndex] = useState<boolean>(true)
+  const [showPageNumber, setShowPageNumber] = useState<boolean>(true)
   const [startTs, setStartTs] = useState<number | null>(null)
   const disabled = useMemo(() => !name.trim().length, [name])
   const percent = useMemo(() => (progress.total ? Math.round((progress.done * 100) / progress.total) : 0), [progress])
@@ -1059,7 +1072,7 @@ export default function App() {
       } else if (format === 'docx') {
         await exportWord(name, (msg: string) => setStatus(msg), (d: number, t: number) => { setProgress({ done: d, total: t }); setStartTs(s => s ?? Date.now()) }, tableId, viewId, insertImages, pageOrientation, showIndex)
       } else {
-        await exportPDF(name, (msg: string) => setStatus(msg), (d: number, t: number) => { setProgress({ done: d, total: t }); setStartTs(s => s ?? Date.now()) }, tableId, viewId, insertImages, pageOrientation, showIndex)
+        await exportPDF(name, (msg: string) => setStatus(msg), (d: number, t: number) => { setProgress({ done: d, total: t }); setStartTs(s => s ?? Date.now()) }, tableId, viewId, insertImages, pageOrientation, showIndex, showPageNumber)
       }
       setStatus('导出完成')
     } catch (e: any) {
@@ -1174,7 +1187,20 @@ export default function App() {
             </div>
           </div>
         ) : null}
-        <button className="btn btn-primary" onClick={onExport} disabled={disabled || exporting}>开始导出</button>
+        {format === 'pdf' ? (
+          <div className="field">
+            <label className="label">显示页码</label>
+            <div className="radio-group">
+              <label style={{ marginRight: 16 }}>
+                <input type="radio" checked={showPageNumber === true} onChange={() => setShowPageNumber(true)} /> 是
+              </label>
+              <label>
+                <input type="radio" checked={showPageNumber === false} onChange={() => setShowPageNumber(false)} /> 否
+              </label>
+            </div>
+          </div>
+        ) : null}
+        <button className="btn btn-primary" onClick={onExport} disabled={disabled || exporting}>导出</button>
         <div className="status">状态：{status}</div>
         {exporting || progress.total > 0 ? (
           <>
